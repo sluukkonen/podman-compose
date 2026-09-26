@@ -32,6 +32,7 @@ from asyncio import Task
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from typing import Awaitable
 from typing import Callable
 from typing import ClassVar
 from typing import Iterable
@@ -1682,6 +1683,22 @@ class ServiceDependency:
         return False
 
 
+class ContainerWaitCondition(Enum):
+    RUNNING_OR_HEALTHY = "running_or_healthy"
+    NOT_CREATED = "not_created"
+    RUNNING = "running"
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    CONFIGURED = "configured"
+    CREATED = "created"
+    EXITED = "exited"
+    INITIALIZED = "initialized"
+    PAUSED = "paused"
+    REMOVING = "removing"
+    STOPPED = "stopped"
+    STOPPING = "stopping"
+
+
 def rec_deps(
     services: dict[str, Any], service_name: str, start_point: str | None = None
 ) -> set[ServiceDependency]:
@@ -1867,7 +1884,17 @@ class Podman:
                 *cmd_ls, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
-            stdout_data, stderr_data = await p.communicate()
+            try:
+                stdout_data, stderr_data = await p.communicate()
+            except asyncio.CancelledError:
+                if p.returncode is None:
+                    p.terminate()
+                try:
+                    await wait_with_timeout(p.wait(), 10)
+                except TimeoutError:
+                    p.kill()
+                    await p.wait()
+                raise
             assert p.returncode is not None
             if p.returncode == 0:
                 return stdout_data
@@ -2453,6 +2480,7 @@ class PodmanCompose:
         self.container_by_name: dict[str, Any]
         self.services: dict[str, Any]
         self.all_services: set[Any] = set()
+        self.completed_dependencies: set[str] = set()
         self.prefer_volume_over_mount = True
         self.x_podman: dict[PodmanCompose.XPodmanSettingKey, Any] = {}
         self.merged_yaml: Any
@@ -3839,58 +3867,297 @@ def get_excluded(
     return excluded
 
 
-async def _validate_completed_successfully(
-    compose: PodmanCompose, container_names: list[str]
+WAIT_POLL_INTERVAL = 0.5
+
+
+def get_wait_deadline(wait_timeout: int | float | None) -> float | None:
+    if wait_timeout is None or wait_timeout == 0:
+        return None
+    return asyncio.get_running_loop().time() + wait_timeout
+
+
+def _has_healthcheck(container_info: dict[str, Any]) -> bool:
+    config = container_info.get("Config") or {}
+    test = (config.get("Healthcheck") or {}).get("Test") or []
+    if test:
+        return str(test[0]).upper() != "NONE"
+    state = container_info.get("State") or {}
+    return bool((state.get("Health") or {}).get("Status"))
+
+
+# pylint: disable-next=too-many-return-statements
+def _container_condition_status(
+    container_name: str,
+    container_info: dict[str, Any],
+    condition: ContainerWaitCondition,
+) -> tuple[bool, str | None]:
+    state = container_info.get("State") or {}
+    status = str(state.get("Status", "")).lower()
+    exit_code = state.get("ExitCode", -1)
+
+    if condition == ContainerWaitCondition.STOPPED:
+        return status in ("stopped", "exited"), None
+
+    if condition == ContainerWaitCondition.EXITED:
+        return status == "exited", None
+
+    if condition == ContainerWaitCondition.NOT_CREATED:
+        return status != "created", None
+
+    if status in ("exited", "stopped", "dead"):
+        return False, f"container {container_name} exited with code {exit_code}"
+
+    health = state.get("Health") or {}
+    health_status = str(health.get("Status", "")).lower()
+
+    if condition == ContainerWaitCondition.RUNNING_OR_HEALTHY:
+        if not _has_healthcheck(container_info):
+            return status == "running", None
+        condition = ContainerWaitCondition.HEALTHY
+
+    if condition == ContainerWaitCondition.HEALTHY:
+        if not _has_healthcheck(container_info):
+            return False, f"container {container_name} has no healthcheck configured"
+        if health_status == "healthy":
+            return True, None
+        if health_status == "unhealthy":
+            return False, f"container {container_name} is unhealthy"
+        if health_status in ("", "starting"):
+            return False, None
+        return False, f"container {container_name} has unexpected health status {health_status!r}"
+
+    if condition == ContainerWaitCondition.UNHEALTHY:
+        return health_status == "unhealthy", None
+
+    return status == condition.value, None
+
+
+async def inspect_wait_containers(
+    compose: PodmanCompose,
+    names: list[str],
+    *,
+    deadline: float | None = None,
+    timeout_message: str = "timeout waiting for containers",
+) -> dict[str, dict[str, Any]]:
+    remaining = None if deadline is None else deadline - asyncio.get_running_loop().time()
+    if remaining is not None and remaining <= 0:
+        raise PodmanComposeError(timeout_message)
+    try:
+        inspect_coro = compose.podman.output([], "inspect", names)
+        if remaining is None:
+            inspect_output = await inspect_coro
+        else:
+            inspect_output = await asyncio.wait_for(inspect_coro, remaining)
+        container_infos = json.loads(inspect_output)
+    except asyncio.TimeoutError as exc:
+        raise PodmanComposeError(timeout_message) from exc
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise PodmanComposeError(f"failed to inspect containers: {', '.join(names)}") from exc
+
+    if not isinstance(container_infos, list) or len(container_infos) != len(names):
+        raise PodmanComposeError(f"failed to inspect containers: {', '.join(names)}")
+    infos_by_name = {
+        str(info.get("Name", "")).removeprefix("/"): info
+        for info in container_infos
+        if isinstance(info, dict)
+    }
+    if any(name not in infos_by_name for name in names):
+        raise PodmanComposeError(f"failed to inspect containers: {', '.join(names)}")
+    return infos_by_name
+
+
+def container_has_started(info: dict[str, Any], previous: dict[str, Any]) -> bool:
+    state = info.get("State") or {}
+    previous_state = previous.get("State") or {}
+    if previous_state.get("Status") == "running" or state.get("Status") == "running":
+        return True
+    # A short-lived job may already have exited before the first inspection.
+    started_at = state.get("StartedAt")
+    return bool(
+        state.get("Status") in ("exited", "stopped", "dead")
+        and started_at
+        and started_at != previous_state.get("StartedAt")
+    )
+
+
+async def wait_for_container_conditions(
+    compose: PodmanCompose,
+    conditions: dict[str, ContainerWaitCondition],
+    *,
+    deadline: float | None = None,
+    timeout_message: str = "timeout waiting for containers",
+    startup_states: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    # Poll until all containers have left the 'created' state
-    # This prevents podman wait from racing against container startup
-    last_log_time = 0.0
-    while True:
+    names = list(conditions)
+    loop = asyncio.get_running_loop()
+
+    while names:
+        infos_by_name = await inspect_wait_containers(
+            compose, names, deadline=deadline, timeout_message=timeout_message
+        )
+
+        all_ready = True
+        for name in names:
+            container_info = infos_by_name[name]
+            if startup_states and name in startup_states:
+                if not container_has_started(container_info, startup_states[name]):
+                    all_ready = False
+                    continue
+            ready, error = _container_condition_status(name, container_info, conditions[name])
+            if error is not None:
+                raise PodmanComposeError(error)
+            all_ready = all_ready and ready
+
+        if all_ready:
+            return
+
+        delay = WAIT_POLL_INTERVAL
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - loop.time()))
+            if delay == 0:
+                raise PodmanComposeError(timeout_message)
+        await asyncio.sleep(delay)
+
+
+def _dependency_wait_condition(condition: ServiceDependencyCondition) -> ContainerWaitCondition:
+    return ContainerWaitCondition(condition.value)
+
+
+PODMAN_WAIT_DEPENDENCY_CONDITIONS = frozenset({
+    ServiceDependencyCondition.CONFIGURED,
+    ServiceDependencyCondition.CREATED,
+    ServiceDependencyCondition.EXITED,
+    ServiceDependencyCondition.INITIALIZED,
+    ServiceDependencyCondition.PAUSED,
+    ServiceDependencyCondition.REMOVING,
+    ServiceDependencyCondition.RUNNING,
+    ServiceDependencyCondition.STOPPED,
+    ServiceDependencyCondition.STOPPING,
+})
+
+
+async def wait_for_dependency_transitions(
+    compose: PodmanCompose,
+    container_names: list[str],
+    condition: ServiceDependencyCondition,
+    *,
+    deadline: float | None = None,
+    output_validator: Callable[[str, bytes], None] | None = None,
+    startup_guard: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, bytes]:
+    """Wait for lifecycle transitions without losing them to snapshot polling."""
+    loop = asyncio.get_running_loop()
+    timeout_message = "timeout waiting for dependencies"
+
+    async def wait_one(container_name: str) -> bytes:
+        if startup_guard is not None:
+            await startup_guard(container_name)
+        while True:
+            remaining = None if deadline is None else deadline - loop.time()
+            if remaining is not None and remaining <= 0:
+                raise PodmanComposeError(timeout_message)
+
+            try:
+                wait_coro = compose.podman.output(
+                    [], "wait", [f"--condition={condition.value}", container_name]
+                )
+                if remaining is None:
+                    wait_output = await wait_coro
+                else:
+                    wait_output = await asyncio.wait_for(wait_coro, remaining)
+                if output_validator is not None:
+                    output_validator(container_name, wait_output)
+                return wait_output
+            except asyncio.TimeoutError as exc:
+                raise PodmanComposeError(timeout_message) from exc
+            except subprocess.CalledProcessError as exc:
+                log.debug(
+                    'Podman wait returned an error (%d) when executing "%s": %s',
+                    exc.returncode,
+                    exc.cmd,
+                    exc,
+                )
+
+            delay = WAIT_POLL_INTERVAL
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - loop.time()))
+                if delay == 0:
+                    raise PodmanComposeError(timeout_message)
+            await asyncio.sleep(delay)
+
+    tasks = [asyncio.create_task(wait_one(name)) for name in container_names]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return dict(zip(container_names, results))
+
+
+async def wait_for_completed_dependencies(
+    compose: PodmanCompose,
+    container_names: list[str],
+    *,
+    deadline: float | None = None,
+    startup_states: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    completed_dependencies = getattr(compose, "completed_dependencies", None)
+    if not isinstance(completed_dependencies, set):
+        completed_dependencies = set()
+        compose.completed_dependencies = completed_dependencies
+
+    pending_names = [name for name in container_names if name not in completed_dependencies]
+    if not pending_names:
+        return
+
+    async def guard_startup(container_name: str) -> None:
+        # Podman wait can return -1 while the container still appears created.
+        # Guard each container independently: a slower replica must not delay
+        # registration of a faster replica's completion wait.
+        await wait_for_container_conditions(
+            compose,
+            {container_name: ContainerWaitCondition.NOT_CREATED},
+            deadline=deadline,
+            timeout_message="timeout waiting for dependencies",
+            startup_states=startup_states,
+        )
+
+    # Podman has no service_completed_successfully condition. Its stopped wait
+    # latches the exit transition and returns the exit code, including when a
+    # restart policy moves the container back to running before an inspect.
+    def validate_exit_code(container_name: str, wait_output: bytes) -> None:
         try:
-            statuses_raw = await compose.podman.output(
-                [], "inspect", ["--format={{.State.Status}}"] + container_names
-            )
-            statuses = statuses_raw.decode().split()
-            if all(s != "created" for s in statuses if s):
-                break
-        except subprocess.CalledProcessError as exc:
-            log.debug(
-                "podman inspect failed while polling for created states: %s",
-                exc,
-            )
-
-        now = asyncio.get_event_loop().time()
-        if now - last_log_time >= 1.0:
-            log.debug(
-                "Waiting for dependency containers to leave 'created' state: %s",
-                ', '.join(container_names),
-            )
-            last_log_time = now
-        await asyncio.sleep(0.05)
-
-    # podman does not actually support value "service_completed_successfully"
-    # default value "stopped" is sent instead
-    await compose.podman.output([], "wait", ["--condition=stopped"] + container_names)
-
-    for container_name in container_names:
-        try:
-            inspect_output = await compose.podman.output([], "inspect", [container_name])
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Container {container_name} disappeared after waiting for stop"
+            exit_code = int(wait_output.strip())
+        except ValueError as exc:
+            raise PodmanComposeError(
+                f"failed to determine exit code for container {container_name}"
             ) from exc
-        container_info = json.loads(inspect_output)[0]
-
-        exit_code = container_info.get("State", {}).get("ExitCode", -1)
         if exit_code != 0:
-            error_msg = (
-                f"Container {container_name} didn't complete successfully: exit code {exit_code}"
+            raise PodmanComposeError(
+                f"container {container_name} didn't complete successfully: exit code {exit_code}"
             )
-            log.error(error_msg)
-            raise RuntimeError(error_msg)
+        completed_dependencies.add(container_name)
+
+    await wait_for_dependency_transitions(
+        compose,
+        pending_names,
+        ServiceDependencyCondition.STOPPED,
+        deadline=deadline,
+        output_validator=validate_exit_code,
+        startup_guard=guard_startup,
+    )
 
 
-async def check_dep_conditions(compose: PodmanCompose, deps: set) -> None:
+async def check_dep_conditions(
+    compose: PodmanCompose,
+    deps: set,
+    *,
+    deadline: float | None = None,
+    startup_states: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Enforce that all specified conditions in deps are met"""
     if not deps:
         return
@@ -3899,55 +4166,31 @@ async def check_dep_conditions(compose: PodmanCompose, deps: set) -> None:
         deps_cd = []
         for d in deps:
             if d.condition == condition:
-                if (
-                    d.condition
-                    in (ServiceDependencyCondition.HEALTHY, ServiceDependencyCondition.UNHEALTHY)
-                ) and (
-                    compose.podman_version is not None
-                    and strverscmp_lt(compose.podman_version, "4.6.0")
-                ):
-                    log.warning(
-                        "Ignored %s condition check due to podman %s doesn't support %s!",
-                        d.name,
-                        compose.podman_version,
-                        condition.value,
-                    )
-                    continue
-
                 deps_cd.extend(compose.container_names_by_service[d.name])
 
         if deps_cd:
-
-            async def wait_one(
-                d_cnt: str, condition: ServiceDependencyCondition = condition
-            ) -> None:
-                while True:
-                    try:
-                        if condition == ServiceDependencyCondition.SERVICE_COMPLETED_SUCCESSFULLY:
-                            await _validate_completed_successfully(compose, [d_cnt])
-                        else:
-                            await compose.podman.output(
-                                [], "wait", [f"--condition={condition.value}", d_cnt]
-                            )
-                        log.debug(
-                            "dependency for condition %s has been fulfilled on container %s",
-                            condition.value,
-                            d_cnt,
-                        )
-                        break
-                    except subprocess.CalledProcessError as _exc:
-                        output = list(
-                            ((_exc.stdout or b"") + (_exc.stderr or b"")).decode().split('\n')
-                        )
-                        log.debug(
-                            'Podman wait returned an error (%d) when executing "%s": %s',
-                            _exc.returncode,
-                            _exc.cmd,
-                            output,
-                        )
-                    await asyncio.sleep(1)
-
-            await asyncio.gather(*(wait_one(cnt) for cnt in deps_cd))
+            if condition == ServiceDependencyCondition.SERVICE_COMPLETED_SUCCESSFULLY:
+                await wait_for_completed_dependencies(
+                    compose, deps_cd, deadline=deadline, startup_states=startup_states
+                )
+            elif condition in PODMAN_WAIT_DEPENDENCY_CONDITIONS:
+                await wait_for_dependency_transitions(
+                    compose, deps_cd, condition, deadline=deadline
+                )
+            else:
+                wait_condition = _dependency_wait_condition(condition)
+                await wait_for_container_conditions(
+                    compose,
+                    {name: wait_condition for name in deps_cd},
+                    deadline=deadline,
+                    timeout_message="timeout waiting for dependencies",
+                    startup_states=startup_states,
+                )
+            log.debug(
+                "dependency condition %s has been fulfilled on containers %s",
+                condition.value,
+                ", ".join(deps_cd),
+            )
 
 
 async def run_container(
@@ -3957,19 +4200,30 @@ async def run_container(
     command: tuple,
     log_formatter: str | None = None,
     suppress_output: bool = False,
+    wait_deadline: float | None = None,
+    startup_states: dict[str, dict[str, Any]] | None = None,
 ) -> int | None:
     """runs a container after waiting for its dependencies to be fulfilled"""
 
     # wait for the dependencies to be fulfilled
     if "start" in command:
         log.debug("Checking dependencies prior to container %s start", name)
-        await check_dep_conditions(compose, deps)
+        await check_dep_conditions(
+            compose, deps, deadline=wait_deadline, startup_states=startup_states
+        )
 
     # start the container
     log.debug("Starting task for container %s", name)
-    return await compose.podman.run(  # type: ignore[misc]
+    exit_code = await compose.podman.run(  # type: ignore[misc]
         *command, log_formatter=log_formatter, suppress_output=suppress_output
     )
+    if exit_code not in (None, 0) and startup_states and name in startup_states:
+        # A failed start leaves the old state in place. Dependents waiting for
+        # a new StartedAt must not remain blocked after the start command exits.
+        infos = await inspect_wait_containers(compose, [name], deadline=wait_deadline)
+        if not container_has_started(infos[name], startup_states[name]):
+            raise PodmanComposeError(f"container {name} failed to start: exit code {exit_code}")
+    return exit_code
 
 
 def deps_from_container(args: argparse.Namespace, cnt: dict) -> set:
@@ -4342,6 +4596,20 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
 
     log.info("starting containers (attached): ...")
 
+    inspected_dependencies = {
+        name
+        for cnt in compose.containers
+        if cnt["_service"] not in excluded
+        for dep in deps_from_container(args, cnt)
+        if dep.condition not in PODMAN_WAIT_DEPENDENCY_CONDITIONS
+        for name in compose.container_names_by_service[dep.name]
+    }
+    startup_states = (
+        await inspect_wait_containers(compose, sorted(inspected_dependencies))
+        if inspected_dependencies
+        else {}
+    )
+
     # TODO: handle already existing
     # TODO: if error creating do not enter loop
     # TODO: colors if sys.stdout.isatty()
@@ -4391,6 +4659,7 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
                         deps_from_container(args, cnt),
                         ([], "start", ["-a", cnt["name"]]),
                         suppress_output=True,
+                        startup_states=startup_states,
                     ),
                     name=cnt["_service"],
                 )
@@ -4405,6 +4674,7 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
                     deps_from_container(args, cnt),
                     ([], "start", ["-a", cnt["name"]]),
                     log_formatter=log_formatter,
+                    startup_states=startup_states,
                 ),
                 name=cnt["_service"],
             )
@@ -4424,6 +4694,26 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
 
     while tasks:
         done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # Always retrieve task results: dependency failures must terminate up
+        # even when neither of the abort-on-container flags was requested.
+        task_error = None
+        for task in done:
+            if task.cancelled():
+                continue
+            try:
+                task.result()
+            except Exception as exc:
+                if task_error is None:
+                    task_error = exc
+        if task_error is not None:
+            for task in tasks:
+                if not _task_cancelled(task):
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise task_error
+
+        done = {task for task in done if not task.cancelled()}
 
         if args.abort_on_container_failure and first_failed_task is None:
             # Generally a single returned item when using asyncio.FIRST_COMPLETED, but that's not

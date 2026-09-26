@@ -1,0 +1,1 @@
+Detect failed health dependencies, preserve successful completion across automatic restarts, and register completion waits independently for each container. Synchronize attached dependency checks with container startup and propagate dependency failures from attached ``up``.

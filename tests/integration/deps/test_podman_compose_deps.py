@@ -5,6 +5,7 @@ import unittest
 
 from packaging import version
 
+from tests.integration.test_utils import EnsureHealthcheckRun
 from tests.integration.test_utils import PodmanAwareRunSubprocessMixin
 from tests.integration.test_utils import RunSubprocessMixin
 from tests.integration.test_utils import get_podman_version
@@ -326,6 +327,34 @@ class TestComposeConditionalDeps(unittest.TestCase, RunSubprocessMixin):
                 "0",
             ])
 
+    def test_deps_observes_exit_while_container_restarts(self) -> None:
+        suffix = "-conditional-restarting"
+        try:
+            self.run_subprocess_assert_returncode([
+                podman_compose_path(),
+                "-f",
+                compose_yaml_path(suffix),
+                "up",
+                "-d",
+            ])
+            output, _ = self.run_subprocess_assert_returncode([
+                "podman",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                "deps_starts_after_exit_1",
+            ])
+            self.assertEqual(output.strip(), b"running")
+        finally:
+            self.run_subprocess_assert_returncode([
+                podman_compose_path(),
+                "-f",
+                compose_yaml_path(suffix),
+                "down",
+                "-t",
+                "0",
+            ])
+
 
 class TestComposeConditionalDepsHealthy(unittest.TestCase, PodmanAwareRunSubprocessMixin):
     def setUp(self) -> None:
@@ -337,14 +366,15 @@ class TestComposeConditionalDepsHealthy(unittest.TestCase, PodmanAwareRunSubproc
     def test_up_deps_healthy(self) -> None:
         suffix = "-conditional-healthy"
         try:
-            self.run_subprocess_assert_returncode([
-                podman_compose_path(),
-                "-f",
-                compose_yaml_path(suffix),
-                "up",
-                "sleep",
-                "--detach",
-            ])
+            with EnsureHealthcheckRun(runner=self, test_case=self, container_name="deps_web_1"):
+                self.run_subprocess_assert_returncode([
+                    podman_compose_path(),
+                    "-f",
+                    compose_yaml_path(suffix),
+                    "up",
+                    "sleep",
+                    "--detach",
+                ])
 
             # Since the command `podman wait --condition=healthy` is invalid prior to 4.6.0,
             # we only validate healthy status for podman 4.6.0+, which won't be tested in the

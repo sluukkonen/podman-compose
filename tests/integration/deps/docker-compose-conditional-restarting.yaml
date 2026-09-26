@@ -1,0 +1,17 @@
+services:
+  restarting:
+    image: nopush/podman-compose-test
+    command: ["sh", "-c", "sleep 0.05 && exit 0"]
+    restart: always
+  starts_after_exit:
+    image: nopush/podman-compose-test
+    command: ["sh", "-c", "sleep 3600"]
+    depends_on:
+      restarting:
+        condition: exited
+  starts_after_success:
+    image: nopush/podman-compose-test
+    command: ["sh", "-c", "sleep 3600"]
+    depends_on:
+      restarting:
+        condition: service_completed_successfully
