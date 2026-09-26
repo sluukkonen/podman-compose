@@ -4391,51 +4391,23 @@ async def prepare_images(
 
 
 async def wait_for_container_running_healthy(
-    compose: PodmanCompose, args: argparse.Namespace
+    compose: PodmanCompose,
+    container_names: list[str],
+    *,
+    completed_container_names: set[str] | None = None,
+    deadline: float | None = None,
 ) -> None:
-    if compose.podman_version is not None and strverscmp_lt(compose.podman_version, "4.6.0"):
-        log.warning("Ignore --wait due to podman %s doesn't support it!", compose.podman_version)
+    completed_container_names = completed_container_names or set()
+    pending_names = [name for name in container_names if name not in completed_container_names]
+    if not pending_names:
         return
-
-    log.info("waiting for all containers to be running|healthy")
-
-    # distinguish between containers that have a healthcheck and those that don't
-    cnt_with_healthcheck = []
-    cnt_without_healthcheck = []
-    for cnt in compose.containers:
-        if "healthcheck" in cnt:
-            cnt_with_healthcheck.append(cnt["name"])
-        else:
-            cnt_without_healthcheck.append(cnt["name"])
-
-    async def run_podman_wait() -> None:
-        # wait for running state of containers without a healthcheck
-        if cnt_without_healthcheck:
-            await compose.podman.run(
-                [],
-                "wait",
-                [
-                    "--condition=running",
-                    "--ignore",
-                    *cnt_without_healthcheck,
-                ],
-            )
-        # wait for healthy state of containers with a healthcheck
-        if cnt_with_healthcheck:
-            await compose.podman.run(
-                [],
-                "wait",
-                [
-                    "--condition=healthy",
-                    "--ignore",
-                    *cnt_with_healthcheck,
-                ],
-            )
-
-    # if --wait-timeout is not set None is used, which means no timeout
-    # https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for
-    # the CancelledError is handled in the compose.podman.run() method
-    await wait_with_timeout(run_podman_wait(), timeout=args.wait_timeout)
+    log.info("waiting for containers to be running|healthy: %s", ", ".join(pending_names))
+    await wait_for_container_conditions(
+        compose,
+        {name: ContainerWaitCondition.RUNNING_OR_HEALTHY for name in pending_names},
+        deadline=deadline,
+        timeout_message="timeout waiting for services to be running|healthy",
+    )
 
 
 @cmd_run(podman_compose, "up", "Create and start the entire stack or some of its services")
@@ -4579,17 +4551,32 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
     if args.detach:
         log.info("starting containers (detached): ...")
         start_error_codes: list[int | None] = []
+        wait_deadline = get_wait_deadline(args.wait_timeout) if args.wait else None
+        active_containers = [cnt for cnt in compose.containers if cnt["_service"] not in excluded]
+        wait_targets = [cnt["name"] for cnt in active_containers]
         for cnt in compose.containers:
             if cnt["_service"] in excluded:
                 log.debug("** skipping start: %s", cnt["name"])
                 continue
             exit_code = await run_container(
-                compose, cnt["name"], deps_from_container(args, cnt), ([], "start", [cnt["name"]])
+                compose,
+                cnt["name"],
+                deps_from_container(args, cnt),
+                ([], "start", [cnt["name"]]),
+                wait_deadline=wait_deadline,
             )
             start_error_codes.append(exit_code)
 
+            if args.wait and exit_code not in (None, 0):
+                return exit_code
+
         if args.wait:
-            await wait_for_container_running_healthy(compose, args)
+            await wait_for_container_running_healthy(
+                compose,
+                wait_targets,
+                completed_container_names=compose.completed_dependencies,
+                deadline=wait_deadline,
+            )
 
         # return first error code from start calls, if any
         return next((code for code in start_error_codes if code is not None and code != 0), 0)
@@ -5027,7 +5014,7 @@ def compose_exec_args(cnt: dict, container_name: str, args: argparse.Namespace) 
 
 async def transfer_service_status(
     compose: PodmanCompose, args: argparse.Namespace, action: str
-) -> None:
+) -> tuple[list[str], list[int | None]]:
     # TODO: handle dependencies, handle creations
     container_names_by_service = compose.container_names_by_service
     if not args.services:
@@ -5054,15 +5041,24 @@ async def transfer_service_status(
             if timeout is not None:
                 podman_args.extend(["-t", str(timeout)])
         tasks.append(asyncio.create_task(compose.podman.run([], action, podman_args + [target])))
-    await asyncio.gather(*tasks)
+    return targets, await asyncio.gather(*tasks)
 
 
 @cmd_run(podman_compose, "start", "start specific services")
-async def compose_start(compose: PodmanCompose, args: argparse.Namespace) -> None:
-    await transfer_service_status(compose, args, "start")
-
+async def compose_start(compose: PodmanCompose, args: argparse.Namespace) -> int | None:
+    targets, exit_codes = await transfer_service_status(compose, args, "start")
+    if args.dry_run:
+        return None
     if args.wait:
-        await wait_for_container_running_healthy(compose, args)
+        start_error = next((code for code in exit_codes if code not in (None, 0)), None)
+        if start_error is not None:
+            return start_error
+
+        wait_deadline = get_wait_deadline(args.wait_timeout)
+        await wait_for_container_running_healthy(compose, targets, deadline=wait_deadline)
+        return 0
+
+    return None
 
 
 @cmd_run(podman_compose, "stop", "stop specific services")

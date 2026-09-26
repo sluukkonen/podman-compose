@@ -15,6 +15,7 @@ from podman_compose import _container_condition_status
 from podman_compose import check_dep_conditions
 from podman_compose import flat_deps
 from podman_compose import wait_for_container_conditions
+from podman_compose import wait_for_container_running_healthy
 
 
 class TestDependsOn(unittest.TestCase):
@@ -524,6 +525,20 @@ class TestCheckDepConditions(unittest.IsolatedAsyncioTestCase):
             await check_dep_conditions(compose, deps, deadline=deadline)
 
         compose.podman.output.assert_awaited_once_with([], "inspect", ["cnt_a"])
+
+    async def test_final_wait_skips_latched_completed_dependencies(self) -> None:
+        compose = mock.Mock()
+        compose.podman.output = mock.AsyncMock(
+            return_value=self.inspect_state("running", name="app")
+        )
+
+        await wait_for_container_running_healthy(
+            compose,
+            ["migration", "app"],
+            completed_container_names={"migration"},
+        )
+
+        compose.podman.output.assert_awaited_once_with([], "inspect", ["app"])
 
     async def test_inspect_failure_is_not_retried_forever(self) -> None:
         compose = mock.Mock()

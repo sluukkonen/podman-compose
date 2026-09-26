@@ -1,0 +1,44 @@
+services:
+  exit_zero:
+    image: podman-compose-wait-test
+    entrypoint: ["dumb-init", "sh", "-c", "exit 0"]
+
+  unhealthy:
+    image: podman-compose-wait-test
+    entrypoint: ["dumb-init", "sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "false"]
+      interval: 1s
+      retries: 1
+
+  dependent:
+    image: podman-compose-wait-test
+    entrypoint: ["dumb-init", "sleep", "infinity"]
+    depends_on:
+      unhealthy:
+        condition: service_healthy
+
+  slow_health:
+    image: podman-compose-wait-test
+    healthcheck:
+      test: "test -f /healthy"
+      interval: 3s
+      retries: 6
+
+  slow_dependent:
+    image: podman-compose-wait-test
+    entrypoint: ["dumb-init", "sleep", "infinity"]
+    depends_on:
+      slow_health:
+        condition: service_healthy
+
+  migration:
+    image: podman-compose-wait-test
+    entrypoint: ["dumb-init", "sh", "-c", "exit 0"]
+
+  after_migration:
+    image: podman-compose-wait-test
+    entrypoint: ["dumb-init", "sleep", "infinity"]
+    depends_on:
+      migration:
+        condition: service_completed_successfully

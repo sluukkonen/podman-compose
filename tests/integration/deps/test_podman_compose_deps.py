@@ -355,6 +355,36 @@ class TestComposeConditionalDeps(unittest.TestCase, RunSubprocessMixin):
                 "0",
             ])
 
+    def test_deps_latches_successful_exit_while_container_restarts(self) -> None:
+        suffix = "-conditional-restarting"
+        try:
+            self.run_subprocess_assert_returncode([
+                podman_compose_path(),
+                "-f",
+                compose_yaml_path(suffix),
+                "up",
+                "--wait",
+                "--wait-timeout",
+                "5",
+            ])
+            output, _ = self.run_subprocess_assert_returncode([
+                "podman",
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                "deps_starts_after_success_1",
+            ])
+            self.assertEqual(output.strip(), b"running")
+        finally:
+            self.run_subprocess_assert_returncode([
+                podman_compose_path(),
+                "-f",
+                compose_yaml_path(suffix),
+                "down",
+                "-t",
+                "0",
+            ])
+
 
 class TestComposeConditionalDepsHealthy(unittest.TestCase, PodmanAwareRunSubprocessMixin):
     def setUp(self) -> None:

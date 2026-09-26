@@ -1,0 +1,1 @@
+Make ``up --wait`` respect selected services, share its timeout with dependency waits, and accept successful one-shot dependencies. Detect readiness from container healthcheck configuration and fail when services exit or become unhealthy. Restrict ``start --wait`` to selected services and preserve its dry-run and post-start timeout behavior.
